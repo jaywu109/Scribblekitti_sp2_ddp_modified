@@ -1,8 +1,5 @@
-import os
-import yaml
-import argparse
+import os, yaml, argparse, torch, math, time, random, datetime
 import numpy as np
-import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import Adam
@@ -17,17 +14,31 @@ from dataloader.semantickitti import SemanticKITTI
 from utils.lovasz import lovasz_softmax
 from utils.consistency_loss import PartialConsistencyLoss
 from utils.evaluation import compute_iou
-import math
+from pytorch_lightning import loggers as pl_loggers
+import warnings
+warnings.filterwarnings("ignore")
 
-import time
 # 19 classes
 class_name = ['car', 'bicycle', 'motorcycle', 'truck', 'other-vehicle', 'person', 'bicyclist', 'motorcyclist', 'road',
               'parking', 'sidewalk', 'other-ground', 'building', 'fence', 'vegetation', 'trunk', 'terrain', 'pole',
               'traffic-sign']
+
 class LightningTrainer(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
+
+        seed=123 
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  
+
         self.config = config
+        self.save_hyperparameters(config)
+        log_folder = config['logger']['root_dir']
+        log_name = config['logger']['name']
+        self.log_folder = f'{log_folder}/{log_name}'
+
         self._load_dataset_info()
         self.student = Cylinder3D(nclasses=self.nclasses, **config['model'])
         self.teacher = Cylinder3D(nclasses=self.nclasses, **config['model'])
@@ -36,10 +47,15 @@ class LightningTrainer(pl.LightningModule):
         self.loss_ls = lovasz_softmax
         self.loss_cl = PartialConsistencyLoss(H=nn.CrossEntropyLoss, ignore_index=0)
         print('initialization', self.global_rank)
+
         self.teacher_cm = ConfusionMatrix(self.nclasses)
         self.student_cm = ConfusionMatrix(self.nclasses)
         self.best_miou = 0
         self.best_iou = np.zeros((self.nclasses-1,))
+
+        self.train_dataset = SemanticKITTI(split='train', config=self.config['dataset'])
+        self.val_dataset = SemanticKITTI(split='valid', config=self.config['dataset'])
+
         self.gpu_num = len(config['trainer']['devices'])
         self.train_batch_size = config['train_dataloader']['batch_size']
         if self.gpu_num > 1:
@@ -48,40 +64,92 @@ class LightningTrainer(pl.LightningModule):
             self.effective_lr = math.sqrt(self.train_batch_size) * self.config["optimizer"]["base_lr"]
 
         print(self.effective_lr)
-        self.save_hyperparameters('config')
+        self.save_hyperparameters({'effective_lr': self.effective_lr})
+
+        self.training_step_outputs = {'loss_list': [], 'first_step': None}
+        self.eval_step_outputs = {'loss_list': [], 'hist_sum': None}
+
+    def setup(self, stage=None):
+        """
+        make datasets & seeding each worker separately
+        """
+        ##############################################
+        # NEED TO SET THE SEED SEPARATELY HERE
+        seed = self.global_rank
+       
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        print('local seed:', seed)
+        ##############################################    
+
+    def train_dataloader(self):
+        return DataLoader(dataset=self.train_dataset, **self.config['train_dataloader'],
+                          collate_fn=self.collate_fn_BEV, pin_memory=True, drop_last=True)
+
+    def val_dataloader(self):
+        return DataLoader(dataset=self.val_dataset, **self.config['val_dataloader'],
+                          collate_fn=self.collate_fn_BEV, pin_memory=True)
 
     def forward(self, model, fea, pos, bs):
         # fea: list
         # pos: list
         # output_voxel = model([fea.squeeze(0)], [pos.squeeze(0)], bs)
         output_voxel = model(fea, pos, bs)  # [2,20,480,360,32]
-        B = output_voxel.shape[0]     # pos [2,124xxx,3], len(pos)=2
-        outputs = [output_voxel[i, :, pos[i][:,0], pos[i][:,1], pos[i][:,2]] for i in np.arange(B)]
-        return outputs
+        return output_voxel
 
     def training_step(self, batch, batch_idx):
-        if self.global_rank == 0:
-            self.update_teacher()
+        # if self.global_rank == 0:
+        #     self.update_teacher()
+        self.update_teacher()
         student_rpz_ten, student_fea_ten, student_label_ten = batch['student']
         teacher_rpz_ten, teacher_fea_ten, _ = batch['teacher']
 
-        student_output_batch = self(self.student, student_fea_ten, student_rpz_ten, self.train_batch_size)
+        batch_size = len(student_fea_ten)
+        student_output_voxel_batch = self(self.student, student_fea_ten, student_rpz_ten, batch_size)
         # student_output_batch[0].shape = [20, 119616]
-        teacher_output_batch = self(self.teacher, teacher_fea_ten, teacher_rpz_ten, self.train_batch_size)
+        teacher_output_voxel_batch = self(self.teacher, teacher_fea_ten, teacher_rpz_ten, batch_size)
+
+        # B = output_voxel.shape[0]     # pos [2,124xxx,3], len(pos)=2
 
         loss = torch.tensor([0.0], device=self.device)
-        for i in np.arange(self.train_batch_size):
+        for i in np.arange(batch_size):
             student_label = student_label_ten[i].unsqueeze(0)
-            student_output, teacher_output = student_output_batch[i].unsqueeze(0), teacher_output_batch[i].unsqueeze(0)
+
+            student_output = student_output_voxel_batch[i, :, student_rpz_ten[i][:,0], student_rpz_ten[i][:,1], student_rpz_ten[i][:,2]].unsqueeze(0)
+            teacher_output = teacher_output_voxel_batch[i, :, teacher_rpz_ten[i][:,0], teacher_rpz_ten[i][:,1], teacher_rpz_ten[i][:,2]].unsqueeze(0)
             loss += self.loss_cl(student_output, teacher_output, student_label) + \
                self.loss_ls(student_output.softmax(1), student_label, ignore=0)
-        train_loss_gather = self.all_gather(loss).mean()
+            
+        self.training_step_outputs['loss_list'].append(loss.cpu().detach())
+        if self.training_step_outputs['first_step'] == None:
+            self.training_step_outputs['first_step'] = self.global_step
 
         if self.global_rank == 0:
-            self.log('train_loss', train_loss_gather, on_epoch=True, prog_bar=True,
-                     batch_size=self.train_batch_size)
+            self.log('train_loss_step', loss, prog_bar=True, rank_zero_only=True, logger=False) 
 
         return loss
+    
+    def on_train_epoch_end(self):
+        loss_list = torch.stack(self.training_step_outputs['loss_list']).to(self.device)
+        loss_list = self.all_gather(loss_list)
+        if self.gpu_num > 1:
+            loss_step_mean = loss_list.mean(dim=0)
+        else:
+            loss_step_mean = loss_list
+
+        if self.global_rank == 0:
+            first_step = self.training_step_outputs['first_step']
+            for loss, step in zip(loss_step_mean, range(first_step, first_step+len(loss_step_mean))):
+                self.logger.experiment.add_scalar('train_loss_step', loss, step)   
+            
+            self.logger.experiment.add_scalar('train_loss_epoch', loss_step_mean.mean(), self.current_epoch)
+
+        del loss_list, loss_step_mean
+        self.training_step_outputs['loss_list'].clear()
+        self.training_step_outputs['first_step'] = None
 
     def validation_step(self, batch, batch_idx):
         student_rpz_ten, student_fea_ten, student_label_ten = batch['student']
@@ -89,15 +157,17 @@ class LightningTrainer(pl.LightningModule):
 
         batch_size = len(student_fea_ten)
 
-        student_output_batch = self(self.student, student_fea_ten, student_rpz_ten, batch_size)
-        teacher_output_batch = self(self.teacher, teacher_fea_ten, teacher_rpz_ten, batch_size)
+        student_output_voxel_batch = self(self.student, student_fea_ten, student_rpz_ten, batch_size)
+        teacher_output_voxel_batch = self(self.teacher, teacher_fea_ten, teacher_rpz_ten, batch_size)
 
         loss = torch.tensor([0.0], device=self.device)
-        B = len(student_label_ten)
-        for i in np.arange(B):
+        for i in np.arange(batch_size):
             teacher_label = teacher_label_ten[i].unsqueeze(0)
             student_label = student_label_ten[i].unsqueeze(0)
-            student_output, teacher_output = student_output_batch[i].unsqueeze(0), teacher_output_batch[i].unsqueeze(0)
+
+            student_output = student_output_voxel_batch[i, :, student_rpz_ten[i][:,0], student_rpz_ten[i][:,1], student_rpz_ten[i][:,2]].unsqueeze(0)
+            teacher_output = teacher_output_voxel_batch[i, :, teacher_rpz_ten[i][:,0], teacher_rpz_ten[i][:,1], teacher_rpz_ten[i][:,2]].unsqueeze(0)
+
             mask = (teacher_label != 0).squeeze()     # student_label = teacher_label
             # print('update_cm', self.global_rank) 每个进程会经过4次此处 when BS=4
             # check below confusion matrix update with ddp, correct?
@@ -106,18 +176,23 @@ class LightningTrainer(pl.LightningModule):
             loss += self.loss_cl(student_output, teacher_output, student_label) + \
                    self.loss_ls(student_output.softmax(1), student_label, ignore=0)
 
-        validation_loss_gather = self.all_gather(loss).mean()
-
-        if self.global_rank == 0:
-            self.log('val_loss', validation_loss_gather, on_epoch=True, prog_bar=True,
-                     batch_size=B)
+        self.eval_step_outputs['loss_list'].append(loss.cpu().detach())
 
     def on_validation_epoch_end(self):
+        loss_mean = torch.stack(self.eval_step_outputs['loss_list']).to(self.device).mean()
+        loss_mean = self.all_gather(loss_mean).mean()
+
         if self.gpu_num > 1:
             student_cm_compute = self.all_gather(self.student_cm.compute().float()).mean(0)
             teacher_cm_compute = self.all_gather(self.teacher_cm.compute().float()).mean(0)
+        else:
+            student_cm_compute = self.student_cm.compute().float()
+            teacher_cm_compute = self.teacher_cm.compute().float()
 
         if self.global_rank == 0:
+            self.log('val_loss', loss_mean, prog_bar=True, logger=False)
+            self.logger.experiment.add_scalar('val_loss', loss_mean, self.global_step) 
+
             student_iou, student_miou = compute_iou(student_cm_compute, ignore_zero=True)
             teacher_iou, teacher_miou = compute_iou(teacher_cm_compute, ignore_zero=True)
 
@@ -126,7 +201,8 @@ class LightningTrainer(pl.LightningModule):
                 self.best_iou = np.nan_to_num(teacher_iou) * 100
             self.log('val_best_miou', self.best_miou, on_epoch=True, prog_bar=True, logger=False)
 
-            file = open('/home/jzhang2297/weaksup/scribblekitti/logs/val_iou.txt', "a")
+            file_path = os.path.join(self.log_folder, 'val_iou.txt')
+            file = open(file_path, "a")
             for classs, class_iou in zip(class_name, teacher_iou):
                 print('%s : %.2f%%' % (classs, class_iou * 100))
                 file.write('teacher iou, training step:{0}'.format(self.global_step))
@@ -158,21 +234,12 @@ class LightningTrainer(pl.LightningModule):
         self.log('val_teacher_miou', teacher_miou, prog_bar=True)
         self.log('val_student_miou', student_miou, prog_bar=True)
 
+        del loss_mean
+        self.eval_step_outputs['loss_list'].clear()
+        
     def configure_optimizers(self):
         optimizer = Adam(self.student.parameters(), lr=self.effective_lr)
         return [optimizer]
-
-    def setup(self, stage):
-        self.train_dataset = SemanticKITTI(split='train', config=self.config['dataset'])
-        self.val_dataset = SemanticKITTI(split='valid', config=self.config['dataset'])
-
-    def train_dataloader(self):
-        return DataLoader(dataset=self.train_dataset, **self.config['train_dataloader'],
-                          collate_fn=self.collate_fn_BEV, pin_memory=True, drop_last=True)
-
-    def val_dataloader(self):
-        return DataLoader(dataset=self.val_dataset, **self.config['val_dataloader'],
-                          collate_fn=self.collate_fn_BEV, pin_memory=True)
 
     def initialize_teacher(self) -> None:
         self.alpha = 0.99 # TODO: Move to config
@@ -192,20 +259,22 @@ class LightningTrainer(pl.LightningModule):
         for i in range(self.nclasses):
             self.color_map[i,:] = torch.tensor(dataset_config['color_map'][i][::-1], dtype=torch.float32)
 
-    def get_model_callback(self):
-        dirpath = os.path.join(self.config['trainer']['default_root_dir'], self.config['logger']['project'])
-        checkpoint = pl.callbacks.ModelCheckpoint(dirpath=dirpath, filename='{epoch}-{val_teacher_miou:.2f}',
-                                                  monitor='val_teacher_miou', mode='max', save_top_k=3)
-        return [checkpoint]
-
     def collate_fn_BEV(self, data):
-        stu_rpz2stack = [d['student'][0] for d in data]
-        stu_fea2stack = [d['student'][1] for d in data]
-        stu_label2stack = [d['student'][2] for d in data]
+        stu_rpz2stack = []
+        stu_fea2stack = []
+        stu_label2stack = []
+        tea_rpz2stack = []
+        tea_fea2stack = []
+        tea_label2stack = []
 
-        tea_rpz2stack = [d['teacher'][0] for d in data]
-        tea_fea2stack = [d['teacher'][1] for d in data]
-        tea_label2stack = [d['teacher'][2] for d in data]
+        for d in data:
+            stu_rpz2stack.append(d['student'][0])
+            stu_fea2stack.append(d['student'][1])
+            stu_label2stack.append(d['student'][2])
+            tea_rpz2stack.append(d['teacher'][0])
+            tea_fea2stack.append(d['teacher'][1])
+            tea_label2stack.append(d['teacher'][2])
+
         return {
                 'student': (stu_rpz2stack, stu_fea2stack, stu_label2stack),
                 'teacher': (tea_rpz2stack, tea_fea2stack, tea_label2stack)
@@ -220,11 +289,37 @@ if __name__=='__main__':
 
     config = yaml.safe_load(open(args.config_path, 'r'))
     config['dataset'].update(yaml.safe_load(open(args.dataset_config_path, 'r')))
-    wandb_logger = WandbLogger(config=config,
-                               save_dir=config['trainer']['default_root_dir'],
-                               **config['logger'])
+
+    gpus = config['trainer']['devices']
+    gpu_num = len(gpus)
+    print(gpus)
+    if gpu_num > 1:
+        strategy='ddp'
+        use_distributed_sampler = True
+    else:
+        strategy = 'auto'
+        use_distributed_sampler = False
+
+    log_folder = config['logger']['root_dir']
+    log_name = config['logger']['name']
+    os.makedirs(f'{log_folder}/{log_name}', exist_ok=True)
+    tb_logger = pl_loggers.TensorBoardLogger(save_dir=log_folder,
+                                             name=log_name,
+                                             default_hp_metric=False)
+    checkpoint = pl.callbacks.ModelCheckpoint(dirpath=f'{log_folder}/{log_name}', filename='{epoch}-{val_teacher_miou:.2f}',
+                                                save_last=True, monitor='val_teacher_miou', mode='max', save_top_k=3)    
+    
+    backup_dir = os.path.join(log_folder, log_name, 'backup_files_%s' % str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')))
+    os.makedirs(backup_dir, exist_ok=True)
+    os.system('cp train.py {}'.format(backup_dir))
+    os.system('cp dataloader/semantickitti.py {}'.format(backup_dir))
+    os.system('cp {} {}'.format(args.config_path, backup_dir))
+
     model = LightningTrainer(config)
-    #ddp = pl.strategies.DDPStrategy(process_group_backend='nccl')
-    Trainer(logger=wandb_logger,
-            callbacks=model.get_model_callback(),
+
+    Trainer(logger=tb_logger,
+            callbacks=[checkpoint],
+            strategy=strategy,
+            use_distributed_sampler=use_distributed_sampler,
+            log_every_n_steps=1,
             **config['trainer']).fit(model)

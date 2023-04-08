@@ -28,20 +28,21 @@ trainer:
   devices:
     - 0
     - 1
-    - 2
-    - 3
-  check_val_every_n_epoch: 1
-  default_root_dir: 'output'
+    # - 2
+    # - 3
+  # default_root_dir: 'output'
   accelerator: 'gpu'
-  sync_batchnorm: False
-  num_sanity_val_steps: 2
-  use_distributed_sampler: True
-  strategy: ddp
+  # check_val_every_n_epoch: 1
+  # sync_batchnorm: False
+  # num_sanity_val_steps: 2
+  # use_distributed_sampler: True
+  # strategy: ddp
 
 
 optimizer:
   base_lr: 0.000707
 
 logger:
-  project: 'scribblekitti'
-  name: 'training'
+  # project: 'scribblekitti'
+  root_dir: 'logs'
+  name: 'training_test'
